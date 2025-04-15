@@ -60,8 +60,7 @@ def duplicated_context(layers_info):
                 duplicated_context_errors.append(f'{layer_name}-{feature.id()}-{field_name}-{value}-{note}')
 
         duplicated_context_errors.sort(key=lambda x: (x.split('-')[0], x.split('-')[3]))
-
-# 💕 位置检查（交叉检查 Cut_No 和几何关系）
+        
 def location_check(layers_info):
     layer_dict = {}
 
@@ -79,16 +78,22 @@ def location_check(layers_info):
         if req not in layer_dict or layer_dict[req] is None:
             iface.messageBar().pushWarning("Family Check", f"⚠️ Missing required layer: {req}")
 
-    # Proceed with checking if layers are present, access the actual layer using ["layer"]
+    # Proceed with checking if layers are present
     excavated_layer = layer_dict.get("Excavated", {}).get("layer")
     cut_layer = layer_dict.get("Cut", {}).get("layer")
     bos_layer = layer_dict.get("Break of Slope", {}).get("layer")
     section_layer = layer_dict.get("Section", {}).get("layer")
+    
+    # Get Drawing Point layer if it exists
+    dp_layer = QgsProject.instance().mapLayersByName("Drawing Point")
+    dp_layer = dp_layer[0] if dp_layer else None
 
-    # Check if layers are missing, if so, initialize empty lists for their data
-    if not excavated_layer or not cut_layer or not bos_layer:
-        iface.messageBar().pushWarning("Family Check", "One or more required layers are missing. Skipping related checks.")
-
+    # Create buffered DP features if DP layer exists
+    dp_buffers = []
+    if dp_layer:
+        for dp_feature in dp_layer.getFeatures():
+            buffered_geom = dp_feature.geometry().buffer(0.5, 5)  # 0.5m buffer with 5 segments
+            dp_buffers.append(buffered_geom)
 
     for ex_feature in excavated_layer.getFeatures() if excavated_layer else []:
         ex_fid = ex_feature["fid"]
@@ -96,14 +101,13 @@ def location_check(layers_info):
 
         cut_match = False
         cut_no = None
-
-        # Check for matching Cut features
         if cut_layer:
             for cut_feature in cut_layer.getFeatures():
                 if ex_feature.geometry().contains(cut_feature.geometry()):
                     cut_no = cut_feature[layer_dict["Cut"]["field"]]
                     cut_match = cut_no == ex_no
                     break
+
         bos_match = False
         bos_count = 0
         bos_no = None
@@ -114,28 +118,59 @@ def location_check(layers_info):
                     bos_no = bos_feature[layer_dict["Break of Slope"]["field"]]
                     bos_match = bos_no == ex_no
                     break
-        section_match = False
-        section_no = "No Section, please check DP"
-        if section_layer:
-            for section_feature in section_layer.getFeatures():
-                if ex_feature.geometry().contains(section_feature.geometry()):
-                    section_no = section_feature[layer_dict["Section"]["field"]]
-                    section_match =  section_no == ex_no
-                    break  
 
-        # Add to mismatch list if there's any issue
-        if not cut_match or (bos_count not in [1, 2]) or not bos_match or not section_match:
+        section_match = False
+        section_no = None
+        section_has_dp = False
+        
+        if section_layer:
+            # Check for matching section features
+            for section_feature in section_layer.getFeatures():
+                if ex_feature.geometry().intersects(section_feature.geometry()):
+                    section_no = section_feature[layer_dict["Section"]["field"]]
+                    section_match = section_no == ex_no
+                    break
+        
+        # If no matching section found, check DP buffers
+        if not section_match and dp_layer:
+            ex_geom = ex_feature.geometry()
+            for dp_buffer in dp_buffers:
+                if ex_geom.intersects(dp_buffer):
+                    section_has_dp = True
+                    break
+
+        # Determine section status
+        if section_match:
+            section_status = "Match"
+        elif section_no:  # Has section but number doesn't match
+            section_status = "Mismatch"
+        elif section_has_dp:  # No section but has DP nearby
+            section_status = "No section but has DP"
+        else:  # No section and no DP
+            section_status = "No section and no DP"
+
+        # Add to mismatch list if:
+        # 1. Any of the compulsory checks fail (cut, BOS)
+        # OR
+        # 2. Section is completely missing with no DP
+        if (not cut_match or 
+            (bos_count not in [1, 2]) or 
+            not bos_match or 
+            (section_status == "No section and no DP")):
+            
             context_not_match.append({
                 'ex_fid': ex_fid,
-                'ex_no':ex_no,
+                'ex_no': ex_no,
                 'cut_no': cut_no,
                 'cut_match': "Match" if cut_match else "Mismatch",
-                'bos_no':bos_no,
+                'bos_no': bos_no,
                 'bos_match': "Match" if bos_match else "Mismatch",
                 'bos_count': "Missing" if not bos_count else bos_count,
-                'section_no':section_no,
-                'section_match': "Match" if section_match else "No Section/Mismatch"
+                'section_no': section_no if section_no else "No Section",
+                'section_match': section_status
             })
+
+
 
 
 # 执行数据检查
@@ -163,6 +198,7 @@ location_check([
     ("Break of Slope", "Cut_No", True),
     ("Section", "Cut_No", False)  
 ])
+
 
 # 生成 HTML 文件
 site_code = "SiteCode"
@@ -215,7 +251,7 @@ with open(html_file_path, "w", encoding="utf-8") as f:
             f.write(f"<tr><td>{layer}</td><td>{fid}</td><td>{field}</td><td>{expected_length}</td><td>{current_value}</td></tr>")
 
         f.write("</table>")
-#duplicated_context_errors.append(f'{layer_name}-{feature.id()}-{field_name}-{feature[field_name]}')
+
     # 📌 输出重复值错误
     if duplicated_context_errors:
         f.write(f"<h2 style='text-align: center;'>Duplicated Context Error ({len(duplicated_context_errors)})</h2>")
@@ -231,21 +267,15 @@ with open(html_file_path, "w", encoding="utf-8") as f:
             note = item[4]
             f.write(f"<tr><td>{layer}</td><td>{fid}</td><td>{field}</td><td>{value}</td><td>{note}</td><tr>")
         f.write("</table>")
+    
     # 📌 Mismatch Table
-
     if context_not_match:
         f.write(f"<h2 style='text-align: center;'>Spatial Mismatches ({len(context_not_match)})</h2>")
-        f.write("<table border='1'><tr><th>Excavted fid</th><th>Excavted No</th><th>Cut No</th><th>Cut Match</th><th>BOS No</th><th>BOS Match</th><th>BOS Count</th><th>Section No</th><th>Section Match</th></tr>")
+        f.write("<table border='1'><tr><th>Excavated fid</th><th>Excavated No</th><th>Cut No</th><th>Cut Match</th><th>BOS No</th><th>BOS Match</th><th>BOS Count</th><th>Section No</th><th>Section Match</th></tr>")
         context_not_match.sort(key=lambda x: x['ex_no'])
         for mismatch in context_not_match:
-            
-            # Instead of using `split()`, directly access the dictionary keys
-            f.write(f"<tr><td>{mismatch['ex_no']}</td><td>{mismatch['ex_fid']}</td><td>{mismatch['cut_no']}</td><td>{mismatch['cut_match']}</td><td>{mismatch['bos_no']}</td><td>{mismatch['bos_match']}</td><td>{mismatch['bos_count']}</td><td>{mismatch['section_no']}</td><td>{mismatch['section_match']}</td></tr>")
-
+            f.write(f"<tr><td>{mismatch['ex_fid']}</td><td>{mismatch['ex_no']}</td><td>{mismatch['cut_no']}</td><td>{mismatch['cut_match']}</td><td>{mismatch['bos_no']}</td><td>{mismatch['bos_match']}</td><td>{mismatch['bos_count']}</td><td>{mismatch['section_no']}</td><td>{mismatch['section_match']}</td></tr>")
         f.write("</table>")
-
-
-
 
     f.write("</body></html>")
 
@@ -255,4 +285,3 @@ if os.path.exists(html_file_path):
     iface.messageBar().pushMessage("Success", f"Report saved to {html_file_path}", level=0, duration=5)
 else:
     iface.messageBar().pushMessage("Error", "Failed to generate HTML report.", level=2, duration=5)
->>>>>>> 208cdb5 (Added the cross check 'Mismatch between families')
